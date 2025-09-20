@@ -10,7 +10,7 @@ class PingCommand(commands.Cog):
     @discord.slash_command(name="ping", description="Check the bot's latency")
     async def ping(self, ctx):
         start = time.perf_counter()
-        message = await ctx.respond("Pong!", ephemeral=True)
+        await ctx.respond("Pong!", ephemeral=True)
         end = time.perf_counter()
         latency = (end - start) * 1000
         await ctx.edit(content=f"Pong! ({latency:.2f} ms)")
