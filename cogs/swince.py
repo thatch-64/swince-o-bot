@@ -1,84 +1,227 @@
-
+import asyncio
 import discord
-import re
-
 from discord.ext import commands
-from collections import Counter
+from utils.mentions import format_mentions, extract_mentions
 
-# Utility function to format mentions with counts
-def format_mentions(users) -> str:
-    counts = Counter(users)
-    return ', '.join(
-        f"{user.mention} ({count}x)" if count > 1 else user.mention
-        for user, count in counts.items()
-    )
 
-# Utility function to extract mentioned users from a message
-def extract_mentions(message, guild) -> list:
-    mention_ids = re.findall(r'<@!?(\d+)>', message.content)
-    return [
-        guild.get_member(int(user_id))
-        for user_id in mention_ids
-        if guild.get_member(int(user_id))
-    ]
+class ConfirmView(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.value = None
 
-class SwinceCommand(commands.Cog):
+    @discord.ui.button(label="Oui", style=discord.ButtonStyle.green)
+    async def yes_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Ceci n'est pas votre soumission!", ephemeral=True)
+            return
+        self.value = True
+        self.stop()
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Non", style=discord.ButtonStyle.red)
+    async def no_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Ceci n'est pas votre soumission!", ephemeral=True)
+            return
+        self.value = False
+        self.stop()
+        await interaction.response.defer()
+
+class SwinceHandler(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-
-    @discord.slash_command(name="swince", description="Envoyez une swince !")
-    async def submit_video(self, ctx):
-        await ctx.respond(
-            "Merci de soumettre votre vidéo ! Veuillez envoyer votre vidéo en pièce jointe ou via un lien.",
-            ephemeral=True
-        )
+        self.sessions = set()
 
     @commands.Cog.listener()
     async def on_message(self, message):
-        # Ignore messages from bots
-        if message.author.bot:
+        if message.author.bot or message.guild is None:
             return
 
-        # Check if the message is a swince submission (video attachment or link)
-        if (
-            not message.reference and (
-                any(
-                    a.content_type and a.content_type.startswith("video")
-                    for a in message.attachments
-                ) or message.content.endswith((".mp4", ".mov", ".avi"))
+        video_attachments = [
+            a for a in message.attachments
+            if a.content_type and a.content_type.startswith("video")
+        ]
+
+        if len(video_attachments) != 1:
+            return
+
+        if message.author.id in self.sessions:
+            await message.channel.send(
+                f"{message.author.mention}, vous avez déjà une soumission active. Veuillez terminer ou attendre.",
+                delete_after=10
             )
-        ):
-            prompt_msgs = [
-                "merci de mentionner toutes les personnes présente dans la swince (ex: @personne-1, @personne-2).",
-                "maintenant merci de mentionner les personnes nominées (ex: @nominé-1, @nominé-2)."
-            ]
-            replies = []
+            return
 
-            for prompt in prompt_msgs:
+        self.sessions.add(message.author.id)
+        try:
+            await self._handle_submission(message)
+        finally:
+            self.sessions.discard(message.author.id)
 
-                prompt_msg = await message.channel.send(f"{message.author.mention}, {prompt}")
+    async def _handle_submission(self, message):
+        user = message.author
+        channel = message.channel
 
-                def check(m):
-                    return m.author == message.author and m.channel == message.channel and m.mentions
+        # Step 1: Initial confirmation
+        embed = self._create_submission_embed(
+            "**Cette vidéo est-elle une soumission de swince ?**"
+        )
+        status_msg = await message.reply(embed=embed, mention_author=False)
 
-                try:
+        if not await self._wait_for_confirmation(user, status_msg, embed):
+            return
 
-                    reply = await self.bot.wait_for("message", check=check, timeout=60)
-                    replies.append((prompt_msg, reply))
+        # Main submission loop
+        while True:
+            # Step 2: Get present users
+            embed = self._create_submission_embed(
+                "**Merci de bien vouloir mentionner/taguer les personne(s) ayant effectué une swince**"
+            )
+            await status_msg.edit(embed=embed, view=None)
 
-                except Exception:
+            present_users = await self._wait_for_mentions(user, channel, status_msg, embed)
+            if present_users is None:
+                return
 
-                    await message.channel.send("Timeout ou aucune mention détectée. Veuillez réessayer.")
-                    return
+            # Step 3: Get nominees
+            present_text = format_mentions(present_users) or "..."
+            embed = self._create_submission_embed(
+                "**Merci de bien vouloir mentionner/taguer les personne(s) nominée(s)**",
+                present_text=present_text
+            )
+            await status_msg.edit(embed=embed)
 
-            present_users = extract_mentions(replies[0][1], message.guild)
-            nominees = extract_mentions(replies[1][1], message.guild)
+            nominees = await self._wait_for_mentions(user, channel, status_msg, embed)
+            if nominees is None:
+                return
 
-            await message.channel.send(f"Merci ! Swinceur(s): {format_mentions(present_users)} | Nominé(s) : {format_mentions(nominees)}")
+            # Step 4: Review and confirm
+            nominees_text = format_mentions(nominees) or "..."
+            embed = self._create_submission_embed(
+                "**Est-ce que les informations ci-dessous sont correctes ?**",
+                present_text=present_text,
+                nominees_text=nominees_text
+            )
+            await status_msg.edit(embed=embed)
 
-            for prompt_msg, reply in replies:
-                await prompt_msg.delete()
-                await reply.delete()
+            if await self._wait_for_confirmation(user, status_msg, embed):
+                await self._finalize_submission(status_msg)
+                break
+
+    @staticmethod
+    def _create_submission_embed(instruction, present_text="...", nominees_text="..."):
+        """Create a submission embed with the given instruction and data."""
+        description = (
+            "Afin de pouvoir soumettre votre swince correctement et mettre à jour les **points** et "
+            "les **nominations en cours**, merci de suivre les __instructions__ ci-dessous.\n\n"
+            f"{instruction}\n\n"
+            f"Personne(s) dans la vidéo\n> {present_text}\n\n"
+            f"Personne(s) nominée(s)\n> {nominees_text}\n"
+        )
+        embed = discord.Embed(
+            title="Soumission de Swince",
+            description=description,
+            color=0xFFFFFF
+        )
+        embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/2599/2599570.png")
+        return embed
+
+    async def _wait_for_confirmation(self, user, status_msg, embed, timeout=60):
+        """Wait for button confirmation with countdown."""
+        view = ConfirmView(user.id)
+        embed.set_footer(
+            text=f"Temps restant pour terminer la soumission : {timeout} secondes",
+            icon_url="https://img.icons8.com/ios7/512/FFFFFF/clock--v3.png"
+        )
+
+        countdown_task = asyncio.create_task(
+            self._update_countdown(status_msg, embed, view, timeout)
+        )
+        await status_msg.edit(embed=embed, view=view)
+        await view.wait()
+        countdown_task.cancel()
+
+        embed.remove_footer()
+        await status_msg.edit(embed=embed, view=None)
+
+        if view.value is None:
+            await self._show_timeout(status_msg, "Aucune confirmation reçue. Processus annulé.")
+
+        return view.value
+
+    async def _wait_for_mentions(self, user, channel, status_msg, embed, timeout=60):
+        """Wait for a message with mentions with countdown."""
+        def check(m):
+            return m.author.id == user.id and m.channel == channel and m.mentions
+
+        embed.set_footer(
+            text=f"Temps restant pour terminer la soumission : {timeout} secondes",
+            icon_url="https://img.icons8.com/ios7/512/FFFFFF/clock--v3.png"
+        )
+
+        countdown_task = asyncio.create_task(
+            self._update_countdown(status_msg, embed, None, timeout)
+        )
+
+        try:
+            reply = await self.bot.wait_for("message", check=check, timeout=timeout)
+            countdown_task.cancel()
+
+            embed.remove_footer()
+            await status_msg.edit(embed=embed)
+
+            mentioned_users = extract_mentions(reply, channel.guild)
+            await reply.delete()
+            return mentioned_users
+
+        except asyncio.TimeoutError:
+            countdown_task.cancel()
+            await self._show_timeout(status_msg, "Aucune mention reçue. Processus annulé.")
+            return None
+        except discord.NotFound:
+            # Message already deleted, not a critical error
+            return mentioned_users if 'mentioned_users' in locals() else None
+
+    @staticmethod
+    async def _update_countdown(message, embed, view, total_seconds):
+        """Update embed footer with countdown every second."""
+        try:
+            for remaining in range(total_seconds - 1, 0, -1):
+                updated_embed = embed.copy()
+                updated_embed.set_footer(
+                    text=f"Temps restant pour terminer la soumission : {remaining} secondes",
+                    icon_url="https://img.icons8.com/ios7/512/FFFFFF/clock--v3.png"
+                )
+                await message.edit(embed=updated_embed, view=view)
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+        except discord.NotFound:
+            pass
+
+    @staticmethod
+    async def _show_timeout(status_msg, description):
+        """Display timeout message."""
+        embed = discord.Embed(
+            title="⏱️ Temps écoulé",
+            description=description,
+            color=0xFF0000
+        )
+        embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/2599/2599570.png")
+        await status_msg.edit(embed=embed, view=None)
+
+    @staticmethod
+    async def _finalize_submission(status_msg):
+        """Display success message."""
+        embed = discord.Embed(
+            title="✅ Soumission de Swince Reçue",
+            description="Votre soumission a été enregistrée avec succès !",
+            color=0x00FF00
+        )
+        embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/2599/2599570.png")
+        await status_msg.edit(embed=embed, view=None)
+
 
 def setup(bot):
-    bot.add_cog(SwinceCommand(bot))
+    bot.add_cog(SwinceHandler(bot))
